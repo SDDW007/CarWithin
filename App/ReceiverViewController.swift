@@ -449,7 +449,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         stack.addArrangedSubview(zeehoCard)
 
         configureConnectionCard(cfmotoCard, title: "春风仪表连接", symbol: "scooter", color: .systemBlue,
-            instructions: "让 iPhone 加入春风仪表 Wi-Fi，打开仪表投屏后启动 CarPlay。春风和极核同一套 PXC 协议（TCP 10922/10711/10710 + 10930 通知），由仪表回连后再逐帧拉画面。", status: cfmotoCardStatus)
+            instructions: "让 iPhone 加入春风仪表 Wi-Fi，打开仪表投屏后启动 CarPlay。", status: cfmotoCardStatus)
         let cfmotoSettings = UIButton(type: .system)
         cfmotoSettings.configuration = .tinted()
         cfmotoSettings.configuration?.title = "连接设置"
