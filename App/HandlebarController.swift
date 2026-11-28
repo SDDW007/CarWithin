@@ -64,6 +64,7 @@ final class HandlebarController: NSObject {
     private var pinnedVolume: Float = 0.5
     private var volumeView: MPVolumeView?
     private var remoteHandlers: [(command: MPRemoteCommand, token: Any)] = []
+    private var volumeRestoreWork: [DispatchWorkItem] = []
 
     private var now: TimeInterval { Date().timeIntervalSince1970 * 1000 }
 
@@ -108,6 +109,8 @@ final class HandlebarController: NSObject {
             $0.pendingLong?.cancel()
         }
         gestures.removeAll()
+        volumeRestoreWork.forEach { $0.cancel() }
+        volumeRestoreWork.removeAll()
         volumeView?.removeFromSuperview()
         volumeView = nil
         onLog?("把手按键已停止")
@@ -139,7 +142,7 @@ final class HandlebarController: NSObject {
         } else {
             tap(key)
         }
-        restoreVolume()
+        lockVolume()
     }
 
     // MARK: - Now Playing（SET）
@@ -261,11 +264,25 @@ final class HandlebarController: NSObject {
         }
     }
 
-    // MARK: - 音量复位
+    // MARK: - 音量锁定
 
-    /// 音量键被当成旋钮用，每次按完把音量拨回锚点，避免声音一直变大/变小。
-    private func restoreVolume() {
-        setSystemVolume(pinnedVolume)
+    /// 音量键被当成旋钮用：每次变化立刻把音量压回锚点，并在随后几百毫秒里连续补压，
+    /// 把系统的「原车音量 +1 / -1」彻底吃掉，避免边导航边被调音量。
+    private func lockVolume() {
+        applyVolume(pinnedVolume)
+        for delay in [0.05, 0.18, 0.4] {
+            let item = DispatchWorkItem { [weak self] in
+                guard let self, self.running else { return }
+                self.applyVolume(self.pinnedVolume)
+            }
+            volumeRestoreWork.append(item)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+        }
+    }
+
+    /// 同步改音量：KVO 回调本身在主线程，直接动 slider 才来得及盖住系统那次步进。
+    private func applyVolume(_ value: Float) {
+        volumeSlider()?.setValue(min(max(value, 0), 1), animated: false)
     }
 
     private func setSystemVolume(_ value: Float) {
