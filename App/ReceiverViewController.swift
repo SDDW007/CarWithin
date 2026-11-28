@@ -1672,7 +1672,7 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
                     .action("恢复默认映射", icon: ("arrow.counterclockwise", .systemGray), destructive: true) { [unowned self] in
                         HandlebarKeyMappingStore.shared.resetAll()
                         self.log("把手映射：已恢复默认")
-                        (self.settingsNavigation ?? self).popViewController(animated: true)
+                        self.settingsNavigation?.popViewController(animated: true)
                     }
                 ])
             ]
@@ -1695,7 +1695,8 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     }
 
     private func stop() {
-        localStartupID = nil        networkStartupTask?.cancel()
+        localStartupID = nil
+        networkStartupTask?.cancel()
         networkStartupTask = nil
         waitingForNetwork = false
         clearStartupHint()
