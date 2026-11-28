@@ -44,10 +44,27 @@ final class HandlebarController: NSObject {
     // 与 Android 版保持一致的手势参数
     private let doubleGapMS = 420.0
     private let longPressMS = 700.0
-    private let edgeBurstGapMS = 900.0
-    private let edgeDedupeMS = 160.0
-    private let burstCount = 3
     private let volumeEpsilon: Float = 0.02
+
+    /// 一次按压可能连着上报好几个音量步进（不同车型 HID 重复上报次数不一样），
+    /// 所以先把一串边沿聚合成「一次按压窗口」，再按窗口里的停顿数和总时长判定单击 / 双击 / 长按。
+    private let burstJoinMS = 700.0
+    private let pressGapMS = 150.0
+    private let burstSettleMS = 180.0
+    private let holdThresholdMS = 650.0
+    private let holdRepeatMS = 400.0
+
+    /// 一次「按压」的聚合状态（▲ / ▼ 共用，因为同一时刻只可能按一个键）。
+    private struct Burst {
+        var key: Key = .up
+        var start: TimeInterval = 0
+        var last: TimeInterval = 0
+        var edges = 0
+        var presses = 1
+        var longFired = false
+        var lastRepeat: TimeInterval = 0
+        var settle: DispatchWorkItem?
+    }
 
     private struct Gesture {
         var pendingSingle: DispatchWorkItem?
@@ -59,6 +76,7 @@ final class HandlebarController: NSObject {
     }
 
     private var gestures: [Key: Gesture] = [:]
+    private var burst: Burst?
     private var running = false
     private var observingVolume = false
     private var pinnedVolume: Float = 0.5
@@ -114,6 +132,8 @@ final class HandlebarController: NSObject {
             $0.pendingLong?.cancel()
         }
         gestures.removeAll()
+        burst?.settle?.cancel()
+        burst = nil
         volumeRestoreWork.forEach { $0.cancel() }
         volumeRestoreWork.removeAll()
         volumeView?.removeFromSuperview()
@@ -130,24 +150,67 @@ final class HandlebarController: NSObject {
         // 我们自己复位造成的回调
         if abs(volume - pinnedVolume) < volumeEpsilon { return }
         let isUp = volume > pinnedVolume
-        let key: Key = isUp ? .up : .down
-        let stamp = now
-        var gesture = gestures[key] ?? Gesture()
-        let gap = stamp - gesture.lastEdge
-        if gap < edgeDedupeMS { return }
-        // 按住不放时音量会连续变化，间隔很短就按"连发"处理
-        gesture.edgeRun = (gap < edgeBurstGapMS && gesture.edgeRun > 0) ? gesture.edgeRun + 1 : 1
-        gesture.lastEdge = stamp
-        gestures[key] = gesture
-
-        if gesture.edgeRun >= burstCount {
-            // 连发：立刻滚动，不再参与单击/双击判定
-            cancelPendingSingle(key)
-            dispatch(.long, key)
-        } else {
-            tap(key)
-        }
+        handleEdge(isUp: isUp)
         lockVolume()
+    }
+
+    /// 音量边沿 → 聚合到一次「按压」里，不再用「连续 3 次才算长按」的死规则。
+    ///
+    /// 老车型按一下只上报 1 次；新车型按一下会连报 3~5 次（HID 重复），
+    /// 之前的写法一按就被判成连发，所以只剩长按能用。
+    private func handleEdge(isUp: Bool) {
+        let stamp = now
+        let key: Key = isUp ? .up : .down
+        var current = burst ?? Burst(key: key)
+        // 换键，或者离上一边沿太久 → 当作新的一次按压
+        if current.edges == 0 || current.key != key || stamp - current.last >= burstJoinMS {
+            burst?.settle?.cancel()
+            current = Burst(key: key)
+            current.start = stamp
+            current.presses = 1
+        } else if stamp - current.last >= pressGapMS {
+            // 窗口里出现明显停顿 → 这是又按了一下（双击的第二次）
+            current.presses += 1
+        }
+        current.edges += 1
+        current.last = stamp
+        current.key = key
+
+        let held = stamp - current.start
+        if held >= holdThresholdMS {
+            if !current.longFired {
+                current.longFired = true
+                current.settle?.cancel()
+                current.settle = nil
+                current.lastRepeat = stamp
+                cancelPendingSingle(key)
+                onLog?("把手键 \(key.handlebarKey.name) 按住 → 连发")
+                dispatch(.long, key)
+            } else if stamp - current.lastRepeat >= holdRepeatMS {
+                current.lastRepeat = stamp
+                dispatch(.long, key)
+            }
+        }
+
+        // 结算：burstSettleMS 内没有新边沿，就认为这次按压结束了
+        let lastEdge = current.last
+        let edges = current.edges
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.running, let b = self.burst else { return }
+            guard b.last == lastEdge, b.edges == edges else { return }
+            self.burst = nil
+            if b.longFired { return }
+            if b.presses >= 2 {
+                self.cancelPendingSingle(b.key)
+                self.dispatch(.double, b.key)
+            } else {
+                self.tap(b.key)
+            }
+        }
+        current.settle?.cancel()
+        current.settle = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + burstSettleMS / 1000, execute: item)
+        burst = current
     }
 
     // MARK: - Now Playing（SET）
