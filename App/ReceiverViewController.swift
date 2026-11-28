@@ -187,6 +187,9 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private lazy var pictureInPicture = CarPlayPictureInPicture(surface: videoSurface)
     private let keepAlive = BackgroundKeepAlive()
     private let keepAliveSwitch = UISwitch()
+    /// 原车把手按键（▲ / ▼ / SET），详见 HandlebarController。
+    private let handlebar = HandlebarController()
+    private let handlebarSwitch = UISwitch()
     private let headUnitOutput = ChoiceMenu(items: ["浏览器", "CarLife", "AirPlay", "台铃 4.3 寸", "九号 5 寸", "极核 6.2 寸", "春风 5 寸", "春风 6.2 寸"])
     private enum HeadUnitOutput: Int {
         case browser, carLife, airPlay, tailing, ninebot, zeeho, cfmoto5, cfmoto62
@@ -241,7 +244,12 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     override var prefersHomeIndicatorAutoHidden: Bool { fullscreenContainer != nil }
     private var displayedVideo = false
     private var identity: AccessoryIdentity?
-    private var running = false
+    private var running = false {
+        didSet {
+            guard running != oldValue else { return }
+            if running { startHandlebar() } else { handlebar.stop() }
+        }
+    }
     private var checkingForUpdates = false
     private var updateCheckTask: Task<Void, Never>?
     private var updateTimer: Timer?
@@ -1600,9 +1608,94 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
         }
     }
 
+    // MARK: 把手按键
+
+    @objc private func handlebarChanged() {
+        UserDefaults.standard.set(handlebarSwitch.isOn, forKey: "handlebarControls")
+        if running {
+            handlebar.stop()
+            startHandlebar()
+        }
+    }
+
+    private func startHandlebar() {
+        guard handlebarSwitch.isOn else { return }
+        handlebar.onLog = { [weak self] message in self?.log(message) }
+        handlebar.binding = { key, trigger in HandlebarKeyMappingStore.shared.binding(key, trigger) }
+        handlebar.onControl = { [weak self] control in self?.performHandlebarControl(control) }
+        handlebar.onAction = { [weak self] action in self?.performHandlebar(action) }
+        handlebar.start()
+    }
+
+    /// 映射表里指定了具体指令：直接下发那条 CarPlay 控制（焦点上/下、选择、返回……）。
+    private func performHandlebarControl(_ control: CarPlayControl) {
+        guard running else {
+            log("把手映射：投屏未运行，忽略「\(control.title)」")
+            return
+        }
+        receiver.press(control)
+    }
+
+    private func performHandlebar(_ action: HandlebarController.Action) {
+        switch action {
+        case .knobPrevious(let count): pulse(.knobPrevious, count: count)
+        case .knobNext(let count): pulse(.knobNext, count: count)
+        case .select: receiver.press(.select)
+        case .back: receiver.press(.back)
+        case .home: receiver.press(.home)
+        case .siri: receiver.press(.siri)
+        }
+    }
+
+    /// 连发时逐个下发，避免同一帧里挤进多次 HID 报告。
+    private func pulse(_ control: CarPlayControl, count: Int) {
+        guard count > 1 else { receiver.press(control); return }
+        for index in 0..<count {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(index) * 0.08) { [weak self] in
+                self?.receiver.press(control)
+            }
+        }
+    }
+
+    /// 「把手按键映射」页：9 个「按键 + 手势」组合，各自选一条 CarPlay 控制指令或「无动作」。
+    fileprivate func keyMappingPage() -> SettingsPageController {
+        page("把手按键映射") { [unowned self] in
+            var rows: [SettingsRow] = []
+            for key in HandlebarKey.allCases {
+                for trigger in HandlebarTrigger.allCases {
+                    rows.append(self.mappingRow(key, trigger))
+                }
+            }
+            return [
+                SettingsSection("映射表", footer: "▲ / ▼ / SET 三个键，每个都能识别单击、双击、长按。「默认」沿用 App 内置行为；选用具体指令后，该手势只发那条 CarPlay 控制；「无动作」表示忽略。修改后立即生效，不用重连。", rows),
+                SettingsSection(footer: "恢复默认只清空这 9 条映射，不影响把手按键总开关。", [
+                    .action("恢复默认映射", icon: ("arrow.counterclockwise", .systemGray), destructive: true) { [unowned self] in
+                        HandlebarKeyMappingStore.shared.resetAll()
+                        self.log("把手映射：已恢复默认")
+                        (self.settingsNavigation ?? self).popViewController(animated: true)
+                    }
+                ])
+            ]
+        }
+    }
+
+    private func mappingRow(_ key: HandlebarKey, _ trigger: HandlebarTrigger) -> SettingsRow {
+        let store = HandlebarKeyMappingStore.shared
+        let menu = ChoiceMenu(items: HandlebarBinding.all.map { $0.title })
+        menu.selectedSegmentIndex = store.binding(key, trigger).menuIndex
+        menu.addAction(UIAction { [weak self, weak menu] _ in
+            guard let self, let menu else { return }
+            let index = min(max(menu.selectedSegmentIndex, 0), HandlebarBinding.all.count - 1)
+            let binding = HandlebarBinding.all[index]
+            store.setBinding(binding, key, trigger)
+            self.log("把手映射：\(key.name) \(trigger.name) → \(binding.title)")
+        }, for: .valueChanged)
+        let icon: (String, UIColor) = (key == .set ? "smallcircle.filled.circle" : (key == .up ? "chevron.up" : "chevron.down"), .systemPink)
+        return .control("\(key.name) · \(trigger.name)", icon: icon, menu)
+    }
+
     private func stop() {
-        localStartupID = nil
-        networkStartupTask?.cancel()
+        localStartupID = nil        networkStartupTask?.cancel()
         networkStartupTask = nil
         waitingForNetwork = false
         clearStartupHint()
@@ -1927,6 +2020,8 @@ extension ReceiverViewController {
         pictureInPictureTiming.addTarget(self, action: #selector(pictureInPictureTimingChanged), for: .valueChanged)
         keepAliveSwitch.isOn = defaults.object(forKey: "backgroundKeepAlive") as? Bool ?? true
         keepAliveSwitch.addTarget(self, action: #selector(keepAliveChanged), for: .valueChanged)
+        handlebarSwitch.isOn = defaults.object(forKey: "handlebarControls") as? Bool ?? true
+        handlebarSwitch.addTarget(self, action: #selector(handlebarChanged), for: .valueChanged)
         let savedOutput = defaults.object(forKey: "headUnitOutputV2") as? Int
         let previousOutput = defaults.object(forKey: "headUnitOutput") as? Int
         let legacyOutput: HeadUnitOutput = defaults.bool(forKey: "carLifeEnabled") ? .carLife : .browser
@@ -2218,6 +2313,13 @@ extension ReceiverViewController {
                     }) { [unowned self] in self.soundPage() },
                     .control("驾驶位", icon: ("steeringwheel", .systemTeal), driveControl),
                     .page("车辆", icon: ("car.fill", .systemTeal)) { [unowned self] in self.vehiclePage() }
+                ]),
+                SettingsSection("把手按键", footer: "春风仪表把手只有 ▲ / ▼ / SET 三个键能传到手机（BACK 被仪表自己吃掉）。默认：▲ 单击=上一项、双击=主页、长按=连续上一项；▼ 单击=下一项、双击=返回、长按=连续下一项；SET 单击=选择、双击=返回、长按=Siri。想换按键含义，进「按键映射」逐条改。音量键会被当作旋钮并自动复位音量，需要 CarPlay 音频在播放。", [
+                    .control("原车把手按键", icon: ("hand.point.up.left.fill", .systemPink), handlebarSwitch),
+                    .page("按键映射", icon: ("keyboard.fill", .systemPink), detail: { [unowned self] in
+                        let count = HandlebarKeyMappingStore.shared.customizedCount
+                        return count == 0 ? "9 项 · 全默认" : "9 项 · 已改 \(count) 项"
+                    }) { [unowned self] in self.keyMappingPage() }
                 ]),
                 SettingsSection("后台与画中画", footer: "锁屏前，请在 iPhone「设置 › 通用 › CarPlay › CarWithin」中打开「锁定时允许 CarPlay」。后台运行会增加耗电。画中画仅显示实时画面。离开 App 时自动开启需打开 iPhone「设置 › 通用 › 画中画」中的自动选项。", [
                     .control("锁屏与后台继续运行", icon: ("lock.fill", .systemPurple), keepAliveSwitch),
