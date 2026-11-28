@@ -65,6 +65,8 @@ final class HandlebarController: NSObject {
     private var volumeView: MPVolumeView?
     private var remoteHandlers: [(command: MPRemoteCommand, token: Any)] = []
     private var volumeRestoreWork: [DispatchWorkItem] = []
+    private var nowPlayingTimer: Timer?
+    private var nowPlayingSince: TimeInterval = 0
 
     private var now: TimeInterval { Date().timeIntervalSince1970 * 1000 }
 
@@ -89,6 +91,7 @@ final class HandlebarController: NSObject {
         session.addObserver(self, forKeyPath: "outputVolume", options: [.new], context: nil)
         observingVolume = true
         registerRemoteCommands()
+        startNowPlayingKeepAlive()
         onLog?("把手按键已就绪（▲ / ▼ / SET）")
     }
 
@@ -103,6 +106,8 @@ final class HandlebarController: NSObject {
             entry.command.removeTarget(entry.token)
         }
         remoteHandlers.removeAll()
+        nowPlayingTimer?.invalidate()
+        nowPlayingTimer = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         gestures.values.forEach {
             $0.pendingSingle?.cancel()
@@ -149,28 +154,60 @@ final class HandlebarController: NSObject {
 
     private func registerRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
-        let info = MPNowPlayingInfoCenter.default()
-        var info3: [String: Any] = [:]
-        info3[MPMediaItemPropertyTitle] = "CarWithin"
-        info3[MPMediaItemPropertyArtist] = "原车把手按键"
-        info3[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
-        info.nowPlayingInfo = info3
+        nowPlayingSince = Date().timeIntervalSince1970
+        assertNowPlaying()
 
         let play = center.playCommand
         play.isEnabled = true
         remoteHandlers.append((play, play.addTarget { [weak self] _ in
-            self?.setKeyDown(); return .success
+            self?.handleMediaKey(); return .success
         }))
         let pause = center.pauseCommand
         pause.isEnabled = true
         remoteHandlers.append((pause, pause.addTarget { [weak self] _ in
-            self?.setKeyDown(); return .success
+            self?.handleMediaKey(); return .success
         }))
         let toggle = center.togglePlayPauseCommand
         toggle.isEnabled = true
         remoteHandlers.append((toggle, toggle.addTarget { [weak self] _ in
-            self?.setKeyDown(); return .success
+            self?.handleMediaKey(); return .success
         }))
+    }
+
+    /// 让 App 一直占着系统的「Now Playing」位。
+    ///
+    /// 仪表发的 SET 是标准 HID 播放/暂停键，iOS 只会把它送给当前的 Now Playing 应用。
+    /// 只要占住这个位子，播放/暂停就落到我们这里被吃掉，CarPlay 里的音乐不会被暂停；
+    /// 一旦被真实播放器抢回去，音乐就会跟着停，所以要定时重刷元数据维持占位。
+    private func startNowPlayingKeepAlive() {
+        nowPlayingTimer?.invalidate()
+        assertNowPlaying()
+        let timer = Timer(timeInterval: 0.45, repeats: true) { [weak self] _ in
+            guard let self, self.running else { return }
+            self.assertNowPlaying()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        nowPlayingTimer = timer
+    }
+
+    private func assertNowPlaying() {
+        guard running else { return }
+        if nowPlayingSince == 0 { nowPlayingSince = Date().timeIntervalSince1970 }
+        var info: [String: Any] = [:]
+        info[MPMediaItemPropertyTitle] = "CarWithin"
+        info[MPMediaItemPropertyArtist] = "原车把手按键"
+        info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+        info[MPMediaItemPropertyPlaybackDuration] = 86400.0
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] =
+            Date().timeIntervalSince1970 - nowPlayingSince
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = .playing
+    }
+
+    /// 媒体键（SET）回调：先把按键交给映射表，再立刻抢回 Now Playing 位。
+    private func handleMediaKey() {
+        setKeyDown()
+        assertNowPlaying()
     }
 
     /// 播放/暂停回调只给"一次"，没有按下状态，合成一次极短的按下+抬起。
@@ -270,7 +307,7 @@ final class HandlebarController: NSObject {
     /// 把系统的「原车音量 +1 / -1」彻底吃掉，避免边导航边被调音量。
     private func lockVolume() {
         applyVolume(pinnedVolume)
-        for delay in [0.05, 0.18, 0.4] {
+        for delay in [0.0, 0.02, 0.06, 0.14, 0.3, 0.55] {
             let item = DispatchWorkItem { [weak self] in
                 guard let self, self.running else { return }
                 self.applyVolume(self.pinnedVolume)
